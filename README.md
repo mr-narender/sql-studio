@@ -46,6 +46,7 @@ sql-studio clickhouse [URL] [USER] [PASSWORD] [DATABASE]
 - Tables page with each table's metadata.
 - Queries page with more access to your db.
 - Infinite scroll rows view.
+- Rich SQL IntelliSense for custom queries.
 
 More features available on the [releases page](https://github.com/frectonz/sql-studio/releases).
 
@@ -71,7 +72,7 @@ More features available on the [releases page](https://github.com/frectonz/sql-s
 ### Install prebuilt binaries via shell script (MacOS and Linux)
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/frectonz/sql-studio/releases/download/0.1.30/sql-studio-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/frectonz/sql-studio/releases/download/0.1.31/sql-studio-installer.sh | sh
 ```
 
 ### Install prebuilt binaries via powershell script
@@ -90,6 +91,19 @@ sql-studio-update
 
 ```bash
 nix shell github:frectonz/sql-studio
+```
+
+## Docker
+
+A Docker image of SQL Studio is available on [Docker Hub](https://hub.docker.com/r/frectonz/sql-studio). The following is an example of how to run SQL Studio with the Postgres driver on port `3030`.
+
+```bash
+docker run -p 3030:3030 frectonz/sql-studio /bin/sql-studio \
+  --no-browser \
+  --no-shutdown \
+  --address=0.0.0.0:3030 \
+  postgres \
+  postgres://localhost:5432/
 ```
 
 ## Contributing
