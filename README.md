@@ -2,7 +2,7 @@
 
 # SQL Studio
 
-Single binary, single command SQL database explorer. SQL studio supports *SQLite*, *libSQL*, *PostgreSQL*, *MySQL* and *DuckDB*.
+Single binary, single command SQL database explorer. SQL studio supports *SQLite*, *libSQL*, *PostgreSQL*, *MySQL*, *DuckDB* and *Microsoft SQL Server*.
 
 ### Local SQLite DB File
 
@@ -46,6 +46,12 @@ sql-studio duckdb [duckdb_file]
 sql-studio clickhouse [URL] [USER] [PASSWORD] [DATABASE]
 ```
 
+### Microsoft SQL Server
+
+```bash
+sql-studio mssql [connection]
+```
+
 ## Features
 
 - Overview page with common metadata.
@@ -78,7 +84,7 @@ More features available on the [releases page](https://github.com/frectonz/sql-s
 ### Install prebuilt binaries via shell script (MacOS and Linux)
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/frectonz/sql-studio/releases/download/0.1.32/sql-studio-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/frectonz/sql-studio/releases/download/0.1.34/sql-studio-installer.sh | sh
 ```
 
 ### Install prebuilt binaries via powershell script

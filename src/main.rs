@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::OptionExt;
 use tokio::sync::mpsc;
@@ -105,6 +104,12 @@ enum Command {
         #[arg(env, default_value = "default")]
         database: String,
     },
+
+    /// A Microsoft SQL Server database.
+    Mssql {
+        /// ADO.NET connection string.
+        connection: String,
+    },
 }
 
 #[tokio::main]
@@ -145,6 +150,9 @@ async fn main() -> color_eyre::Result<()> {
         } => AllDbs::Clickhouse(Box::new(
             clickhouse::Db::open(url, user, password, database, args.timeout.into()).await?,
         )),
+        Command::Mssql { connection } => {
+            AllDbs::MsSql(mssql::Db::open(connection, args.timeout.into()).await?)
+        }
     };
 
     let mut index_html = statics::get_index_html()?;
@@ -288,20 +296,34 @@ mod statics {
     }
 }
 
-#[async_trait]
 trait Database: Sized + Clone + Send {
-    async fn overview(&self) -> color_eyre::Result<responses::Overview>;
+    fn overview(
+        &self,
+    ) -> impl std::future::Future<Output = color_eyre::Result<responses::Overview>> + Send;
 
-    async fn tables(&self) -> color_eyre::Result<responses::Tables>;
+    fn tables(
+        &self,
+    ) -> impl std::future::Future<Output = color_eyre::Result<responses::Tables>> + Send;
 
-    async fn table(&self, name: String) -> color_eyre::Result<responses::Table>;
+    fn table(
+        &self,
+        name: String,
+    ) -> impl std::future::Future<Output = color_eyre::Result<responses::Table>> + Send;
 
-    async fn table_data(&self, name: String, page: i32)
-        -> color_eyre::Result<responses::TableData>;
+    fn table_data(
+        &self,
+        name: String,
+        page: i32,
+    ) -> impl std::future::Future<Output = color_eyre::Result<responses::TableData>> + Send;
 
-    async fn tables_with_columns(&self) -> color_eyre::Result<responses::TablesWithColumns>;
+    fn tables_with_columns(
+        &self,
+    ) -> impl std::future::Future<Output = color_eyre::Result<responses::TablesWithColumns>> + Send;
 
-    async fn query(&self, query: String) -> color_eyre::Result<responses::Query>;
+    fn query(
+        &self,
+        query: String,
+    ) -> impl std::future::Future<Output = color_eyre::Result<responses::Query>> + Send;
 }
 
 #[derive(Clone)]
@@ -312,9 +334,9 @@ enum AllDbs {
     Mysql(mysql::Db),
     Duckdb(duckdb::Db),
     Clickhouse(Box<clickhouse::Db>),
+    MsSql(mssql::Db),
 }
 
-#[async_trait]
 impl Database for AllDbs {
     async fn overview(&self) -> color_eyre::Result<responses::Overview> {
         match self {
@@ -324,6 +346,7 @@ impl Database for AllDbs {
             AllDbs::Mysql(x) => x.overview().await,
             AllDbs::Duckdb(x) => x.overview().await,
             AllDbs::Clickhouse(x) => x.overview().await,
+            AllDbs::MsSql(x) => x.overview().await,
         }
     }
 
@@ -335,6 +358,7 @@ impl Database for AllDbs {
             AllDbs::Mysql(x) => x.tables().await,
             AllDbs::Duckdb(x) => x.tables().await,
             AllDbs::Clickhouse(x) => x.tables().await,
+            AllDbs::MsSql(x) => x.tables().await,
         }
     }
 
@@ -346,6 +370,7 @@ impl Database for AllDbs {
             AllDbs::Mysql(x) => x.table(name).await,
             AllDbs::Duckdb(x) => x.table(name).await,
             AllDbs::Clickhouse(x) => x.table(name).await,
+            AllDbs::MsSql(x) => x.table(name).await,
         }
     }
 
@@ -361,6 +386,7 @@ impl Database for AllDbs {
             AllDbs::Mysql(x) => x.table_data(name, page).await,
             AllDbs::Duckdb(x) => x.table_data(name, page).await,
             AllDbs::Clickhouse(x) => x.table_data(name, page).await,
+            AllDbs::MsSql(x) => x.table_data(name, page).await,
         }
     }
 
@@ -372,6 +398,7 @@ impl Database for AllDbs {
             AllDbs::Mysql(x) => x.tables_with_columns().await,
             AllDbs::Duckdb(x) => x.tables_with_columns().await,
             AllDbs::Clickhouse(x) => x.tables_with_columns().await,
+            AllDbs::MsSql(x) => x.tables_with_columns().await,
         }
     }
 
@@ -383,19 +410,14 @@ impl Database for AllDbs {
             AllDbs::Mysql(x) => x.query(query).await,
             AllDbs::Duckdb(x) => x.query(query).await,
             AllDbs::Clickhouse(x) => x.query(query).await,
+            AllDbs::MsSql(x) => x.query(query).await,
         }
     }
 }
 
 mod sqlite {
-    use async_trait::async_trait;
     use color_eyre::eyre::OptionExt;
-    use std::{
-        collections::HashMap,
-        path::Path,
-        sync::Arc,
-        time::{Duration, SystemTime},
-    };
+    use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
     use tokio_rusqlite::{Connection, OpenFlags};
 
     use crate::{helpers, responses, Database, ROWS_PER_PAGE, SAMPLE_DB};
@@ -443,7 +465,6 @@ mod sqlite {
         }
     }
 
-    #[async_trait]
     impl Database for Db {
         async fn overview(&self) -> color_eyre::Result<responses::Overview> {
             let file_name = Path::new(&self.path)
@@ -771,41 +792,31 @@ mod sqlite {
         }
 
         async fn query(&self, query: String) -> color_eyre::Result<responses::Query> {
-            let start = SystemTime::now();
-            let timeout = self.query_timeout;
+            let res = self.conn.call(move |conn| {
+                let mut stmt = conn.prepare(&query)?;
+                let columns = stmt
+                    .column_names()
+                    .into_iter()
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
 
-            let res = self
-                .conn
-                .call(move |conn| {
-                    let mut stmt = conn.prepare(&query)?;
-                    let columns = stmt
-                        .column_names()
-                        .into_iter()
-                        .map(ToOwned::to_owned)
-                        .collect::<Vec<_>>();
+                let columns_len = columns.len();
+                let rows: Result<Vec<_>, _> = stmt
+                    .query_map((), |r| {
+                        let mut rows = Vec::with_capacity(columns_len);
+                        for i in 0..columns_len {
+                            let val = helpers::rusqlite_value_to_json(r.get_ref(i)?);
+                            rows.push(val);
+                        }
+                        Ok(rows)
+                    })?
+                    .collect();
+                let rows = rows?;
 
-                    let columns_len = columns.len();
-                    let rows: Result<Vec<_>, _> = stmt
-                        .query_map((), |r| {
-                            let now = SystemTime::now();
-                            if now - timeout >= start {
-                                // just used a random error, we just want to bail out
-                                return Err(rusqlite::Error::InvalidQuery);
-                            }
+                Ok(responses::Query { columns, rows })
+            });
 
-                            let mut rows = Vec::with_capacity(columns_len);
-                            for i in 0..columns_len {
-                                let val = helpers::rusqlite_value_to_json(r.get_ref(i)?);
-                                rows.push(val);
-                            }
-                            Ok(rows)
-                        })?
-                        .collect();
-                    let rows = rows?;
-
-                    Ok(responses::Query { columns, rows })
-                })
-                .await?;
+            let res = tokio::time::timeout(self.query_timeout, res).await??;
 
             Ok(res)
         }
@@ -815,7 +826,6 @@ mod sqlite {
 mod libsql {
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
-    use async_trait::async_trait;
     use color_eyre::eyre::OptionExt;
     use futures::{StreamExt, TryStreamExt};
     use libsql::Builder;
@@ -900,7 +910,6 @@ mod libsql {
         }
     }
 
-    #[async_trait]
     impl Database for Db {
         async fn overview(&self) -> color_eyre::Result<responses::Overview> {
             let file_name = self.name.to_owned();
@@ -1379,7 +1388,6 @@ mod libsql {
 mod postgres {
     use std::{sync::Arc, time::Duration};
 
-    use async_trait::async_trait;
     use tokio_postgres::{Client, NoTls};
 
     use crate::{
@@ -1439,7 +1447,6 @@ mod postgres {
         }
     }
 
-    #[async_trait]
     impl Database for Db {
         async fn overview(&self) -> color_eyre::Result<responses::Overview> {
             let schema = &self.schema;
@@ -1905,7 +1912,6 @@ mod postgres {
 mod mysql {
     use std::time::Duration;
 
-    use async_trait::async_trait;
     use color_eyre::eyre::OptionExt;
     use mysql_async::{prelude::*, Pool};
 
@@ -1950,7 +1956,6 @@ mod mysql {
         }
     }
 
-    #[async_trait]
     impl Database for Db {
         async fn overview(&self) -> color_eyre::Result<responses::Overview> {
             let mut conn = self.pool.get_conn().await?;
@@ -2342,7 +2347,6 @@ mod mysql {
 }
 
 mod duckdb {
-    use async_trait::async_trait;
     use color_eyre::eyre;
     use color_eyre::eyre::OptionExt;
     use duckdb::{Config, Connection};
@@ -2404,7 +2408,6 @@ mod duckdb {
         }
     }
 
-    #[async_trait]
     impl Database for Db {
         async fn overview(&self) -> color_eyre::Result<responses::Overview> {
             let file_name = Path::new(&self.path)
@@ -2753,7 +2756,6 @@ mod duckdb {
 }
 
 mod clickhouse {
-    use async_trait::async_trait;
     use clickhouse::Client;
     use color_eyre::eyre::OptionExt;
     use std::time::Duration;
@@ -2814,7 +2816,6 @@ mod clickhouse {
         }
     }
 
-    #[async_trait]
     impl Database for Db {
         async fn overview(&self) -> color_eyre::Result<responses::Overview> {
             let file_name = self.database.to_owned();
@@ -3148,9 +3149,563 @@ mod clickhouse {
     }
 }
 
+mod mssql {
+    use std::{sync::Arc, time::Duration};
+
+    use color_eyre::eyre::OptionExt;
+    use futures::{StreamExt, TryStreamExt};
+    use tiberius::{Client, Config};
+    use tokio::{net::TcpStream, sync::Mutex};
+
+    use crate::{
+        helpers::{self, mssql_value_to_json},
+        responses::{self, Count},
+        Database, ROWS_PER_PAGE,
+    };
+
+    #[derive(Clone)]
+    pub struct Db {
+        client: Arc<Mutex<Client<tokio_util::compat::Compat<TcpStream>>>>,
+        query_timeout: Duration,
+    }
+
+    impl Db {
+        pub async fn open(connection: String, query_timeout: Duration) -> color_eyre::Result<Self> {
+            use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+            let config = Config::from_ado_string(&connection)?;
+            let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
+            tcp.set_nodelay(true)?;
+
+            let mut client = Client::connect(config, tcp.compat_write()).await?;
+
+            let tables: i32 = client
+                .query(
+                    r#"
+                SELECT COUNT(*) AS count
+                FROM sys.tables t
+                JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = SCHEMA_NAME();
+                    "#,
+                    &[],
+                )
+                .await?
+                .into_row()
+                .await?
+                .and_then(|row| row.get("count"))
+                .ok_or_eyre("couldn't count tables")?;
+
+            tracing::info!(
+                "found {tables} table{} in {connection}",
+                if tables == 1 { "" } else { "s" }
+            );
+
+            Ok(Self {
+                client: Arc::new(Mutex::new(client)),
+                query_timeout,
+            })
+        }
+    }
+
+    impl Database for Db {
+        async fn overview(&self) -> color_eyre::Result<responses::Overview> {
+            let mut client = self.client.lock().await;
+
+            let file_name = client
+                .query(
+                    r#"
+                SELECT DB_NAME() AS name;
+                    "#,
+                    &[],
+                )
+                .await?
+                .into_row()
+                .await?
+                .and_then(|row| row.get::<&str, &str>("name").map(ToOwned::to_owned))
+                .ok_or_eyre("couldn't get database name")?;
+
+            let db_size: i64 = client
+                .query(
+                    r#"
+                SELECT SUM(a.total_pages * 8) AS size_kb
+                FROM sys.tables t
+                JOIN sys.indexes i ON t.object_id = i.object_id
+                JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
+                JOIN sys.allocation_units a ON p.partition_id = a.container_id;
+                    "#,
+                    &[],
+                )
+                .await?
+                .into_row()
+                .await?
+                .and_then(|row| row.get("size_kb"))
+                .ok_or_eyre("couldn't get database size")?;
+            let db_size = helpers::format_size(db_size as f64);
+
+            let modified = None;
+            let created = None;
+
+            let tables: i32 = client
+                .query(
+                    r#"
+                SELECT COUNT(*) AS count
+                FROM sys.tables t
+                JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = SCHEMA_NAME();
+                    "#,
+                    &[],
+                )
+                .await?
+                .into_row()
+                .await?
+                .and_then(|row| row.get("count"))
+                .ok_or_eyre("couldn't count tables")?;
+
+            let indexes: i32 = client
+                .query(
+                    r#"
+                SELECT COUNT(*) AS count
+                FROM sys.stats s
+                JOIN sys.tables t ON s.object_id = t.object_id
+                JOIN sys.schemas sc ON t.schema_id = sc.schema_id
+                WHERE sc.name = SCHEMA_NAME();
+                    "#,
+                    &[],
+                )
+                .await?
+                .into_row()
+                .await?
+                .and_then(|row| row.get("count"))
+                .ok_or_eyre("couldn't count indexes")?;
+
+            let triggers: i32 = client
+                .query(
+                    r#"
+                SELECT COUNT(*) AS count
+                FROM sys.triggers t
+                JOIN sys.tables tbl ON t.parent_id = tbl.object_id
+                JOIN sys.schemas s ON tbl.schema_id = s.schema_id
+                WHERE s.name = SCHEMA_NAME();
+                    "#,
+                    &[],
+                )
+                .await?
+                .into_row()
+                .await?
+                .and_then(|row| row.get("count"))
+                .ok_or_eyre("couldn't count triggers")?;
+
+            let views: i32 = client
+                .query(
+                    r#"
+                SELECT COUNT(*) AS count
+                FROM sys.views v
+                JOIN sys.schemas s ON v.schema_id = s.schema_id
+                WHERE s.name = SCHEMA_NAME();
+                    "#,
+                    &[],
+                )
+                .await?
+                .into_row()
+                .await?
+                .and_then(|row| row.get("count"))
+                .ok_or_eyre("couldn't count triggers")?;
+
+            let mut row_counts = client
+                .query(
+                    r#"
+                SELECT t.name AS name
+                FROM sys.tables t
+                JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = SCHEMA_NAME();
+                    "#,
+                    &[],
+                )
+                .await?
+                .into_row_stream()
+                .try_filter_map(|row| {
+                    let out = Ok(row.get::<&str, &str>("name").map(ToOwned::to_owned));
+                    async { out }
+                })
+                .map_ok(|name| Count { name, count: 0 })
+                .filter_map(|count| async { count.ok() })
+                .collect::<Vec<_>>()
+                .await;
+
+            for count in row_counts.iter_mut() {
+                let sql = format!("SELECT count(*) AS count FROM {}", count.name);
+
+                count.count = client
+                    .query(sql, &[])
+                    .await?
+                    .into_row()
+                    .await?
+                    .and_then(|row| row.get("count"))
+                    .ok_or_eyre("couldn't count rows")?;
+            }
+
+            row_counts.sort_by(|a, b| b.count.cmp(&a.count));
+
+            let mut column_counts = client
+                .query(
+                    r#"
+                SELECT t.name AS name
+                FROM sys.tables t
+                JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = SCHEMA_NAME();
+                    "#,
+                    &[],
+                )
+                .await?
+                .into_row_stream()
+                .try_filter_map(|row| {
+                    let out = Ok(row.get::<&str, &str>("name").map(ToOwned::to_owned));
+                    async { out }
+                })
+                .map_ok(|name| Count {
+                    name: name.to_owned(),
+                    count: 0,
+                })
+                .filter_map(|count| async { count.ok() })
+                .collect::<Vec<_>>()
+                .await;
+
+            for count in column_counts.iter_mut() {
+                count.count = client
+                    .query(
+                        r#"
+                    SELECT COUNT(*) AS count
+                    FROM sys.columns c
+                    JOIN sys.tables t ON c.object_id = t.object_id
+                    JOIN sys.schemas s ON t.schema_id = s.schema_id
+                    WHERE s.name = SCHEMA_NAME()
+                    AND t.name = @P1;
+                        "#,
+                        &[&count.name],
+                    )
+                    .await?
+                    .into_row()
+                    .await?
+                    .and_then(|row| row.get("count"))
+                    .ok_or_eyre("couldn't count columns")?;
+            }
+
+            column_counts.sort_by(|a, b| b.count.cmp(&a.count));
+
+            let mut index_counts = client
+                .query(
+                    r#"
+                SELECT t.name AS name
+                FROM sys.tables t
+                JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = SCHEMA_NAME();
+                    "#,
+                    &[],
+                )
+                .await?
+                .into_row_stream()
+                .try_filter_map(|row| {
+                    let out = Ok(row.get::<&str, &str>("name").map(ToOwned::to_owned));
+                    async { out }
+                })
+                .map_ok(|name| Count {
+                    name: name.to_owned(),
+                    count: 0,
+                })
+                .filter_map(|count| async { count.ok() })
+                .collect::<Vec<_>>()
+                .await;
+
+            for count in index_counts.iter_mut() {
+                count.count = client
+                    .query(
+                        r#"
+                    SELECT COUNT(*) AS count
+                    FROM sys.stats s
+                    JOIN sys.tables t ON s.object_id = t.object_id
+                    JOIN sys.schemas sc ON t.schema_id = sc.schema_id
+                    WHERE sc.name = SCHEMA_NAME()
+                    AND t.name = @P1;
+                        "#,
+                        &[&count.name],
+                    )
+                    .await?
+                    .into_row()
+                    .await?
+                    .and_then(|row| row.get("count"))
+                    .ok_or_eyre("couldn't count indexes")?;
+            }
+
+            index_counts.sort_by(|a, b| b.count.cmp(&a.count));
+
+            Ok(responses::Overview {
+                file_name,
+                sqlite_version: None,
+                db_size,
+                created,
+                modified,
+                tables,
+                indexes,
+                triggers,
+                views,
+                row_counts,
+                column_counts,
+                index_counts,
+            })
+        }
+
+        async fn tables(&self) -> color_eyre::Result<responses::Tables> {
+            let mut client = self.client.lock().await;
+
+            let mut tables = client
+                .query(
+                    r#"
+                SELECT t.name AS name
+                FROM sys.tables t
+                JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = SCHEMA_NAME();
+                    "#,
+                    &[],
+                )
+                .await?
+                .into_row_stream()
+                .try_filter_map(|row| {
+                    let out = Ok(row.get::<&str, &str>("name").map(ToOwned::to_owned));
+                    async { out }
+                })
+                .map_ok(|name| Count { name, count: 0 })
+                .filter_map(|count| async { count.ok() })
+                .collect::<Vec<_>>()
+                .await;
+
+            for count in tables.iter_mut() {
+                let sql = format!("SELECT count(*) AS count FROM {}", count.name);
+
+                count.count = client
+                    .query(sql, &[])
+                    .await?
+                    .into_row()
+                    .await?
+                    .and_then(|row| row.get("count"))
+                    .ok_or_eyre("couldn't count rows")?;
+            }
+
+            tables.sort_by(|a, b| b.count.cmp(&a.count));
+
+            Ok(responses::Tables { tables })
+        }
+
+        async fn table(&self, name: String) -> color_eyre::Result<responses::Table> {
+            let mut client = self.client.lock().await;
+
+            let row_count: i32 = client
+                .query(format!("SELECT count(*) AS count FROM {name}"), &[])
+                .await?
+                .into_row()
+                .await?
+                .and_then(|row| row.get("count"))
+                .ok_or_eyre("couldn't count rows")?;
+
+            let table_size: i64 = client
+                .query(
+                    r#"
+                SELECT SUM(a.total_pages) * 8 AS size_kb
+                FROM sys.partitions p
+                JOIN sys.allocation_units a ON p.partition_id = a.container_id
+                JOIN sys.tables t ON p.object_id = t.object_id
+                JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = SCHEMA_NAME() AND t.name = @P1;
+                    "#,
+                    &[&name],
+                )
+                .await?
+                .into_row()
+                .await?
+                .and_then(|row| row.get("size_kb"))
+                .ok_or_eyre("couldn't count rows")?;
+            let table_size = helpers::format_size(table_size as f64);
+
+            let index_count: i32 = client
+                .query(
+                    r#"
+                SELECT COUNT(*) AS count
+                FROM sys.stats s
+                JOIN sys.tables t ON s.object_id = t.object_id
+                JOIN sys.schemas sc ON t.schema_id = sc.schema_id
+                WHERE sc.name = SCHEMA_NAME() AND t.name = @P1;
+                    "#,
+                    &[&name],
+                )
+                .await?
+                .into_row()
+                .await?
+                .and_then(|row| row.get("count"))
+                .ok_or_eyre("couldn't count indexes")?;
+
+            let column_count: i32 = client
+                .query(
+                    r#"
+                SELECT COUNT(*) AS count
+                FROM sys.columns c
+                JOIN sys.tables t ON c.object_id = t.object_id
+                JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = SCHEMA_NAME() AND t.name = @P1;
+                    "#,
+                    &[&name],
+                )
+                .await?
+                .into_row()
+                .await?
+                .and_then(|row| row.get("count"))
+                .ok_or_eyre("couldn't count columns")?;
+
+            Ok(responses::Table {
+                name,
+                sql: None,
+                row_count,
+                table_size,
+                index_count,
+                column_count,
+            })
+        }
+
+        async fn table_data(
+            &self,
+            name: String,
+            page: i32,
+        ) -> color_eyre::Result<responses::TableData> {
+            let mut client = self.client.lock().await;
+
+            let first_column: String = client
+                .query(
+                    r#"
+                SELECT TOP 1 column_name AS name
+                FROM information_schema.columns
+                WHERE table_schema = SCHEMA_NAME()
+                AND table_name = @P1;
+                    "#,
+                    &[&name],
+                )
+                .await?
+                .into_row()
+                .await?
+                .and_then(|row| row.get::<&str, &str>("name").map(ToOwned::to_owned))
+                .ok_or_eyre("couldn't count columns")?;
+
+            let offset = (page - 1) * ROWS_PER_PAGE;
+            let sql = format!(
+                r#"
+            SELECT * FROM "{name}"
+            ORDER BY {first_column}
+            OFFSET {offset} ROWS FETCH NEXT {ROWS_PER_PAGE} ROWS ONLY;
+                "#
+            );
+
+            let mut query = client.query(sql, &[]).await?;
+            let columns: Vec<String> = query
+                .columns()
+                .await?
+                .unwrap_or_default()
+                .iter()
+                .map(|c| c.name().to_owned())
+                .collect();
+
+            let rows = query
+                .into_row_stream()
+                .map_ok(|row| row.into_iter().map(mssql_value_to_json).collect::<Vec<_>>())
+                .filter_map(|count| async { count.ok() })
+                .collect::<Vec<_>>()
+                .await;
+
+            Ok(responses::TableData { columns, rows })
+        }
+
+        async fn tables_with_columns(&self) -> color_eyre::Result<responses::TablesWithColumns> {
+            let mut client = self.client.lock().await;
+
+            let table_names = client
+                .query(
+                    r#"
+                SELECT t.name AS name
+                FROM sys.tables t
+                JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = SCHEMA_NAME();
+                    "#,
+                    &[],
+                )
+                .await?
+                .into_row_stream()
+                .try_filter_map(|row| {
+                    let out = Ok(row.get::<&str, &str>("name").map(ToOwned::to_owned));
+                    async { out }
+                })
+                .filter_map(|count| async { count.ok() })
+                .collect::<Vec<_>>()
+                .await;
+
+            let mut tables = Vec::with_capacity(table_names.len());
+            for table_name in table_names {
+                let columns = client
+                    .query(
+                        r#"
+                    SELECT column_name AS name
+                    FROM information_schema.columns
+                    WHERE table_schema = SCHEMA_NAME()
+                    AND table_name = @P1;
+                        "#,
+                        &[&table_name],
+                    )
+                    .await?
+                    .into_row_stream()
+                    .try_filter_map(|row| {
+                        let out = Ok(row.get::<&str, &str>("name").map(ToOwned::to_owned));
+                        async { out }
+                    })
+                    .filter_map(|count| async { count.ok() })
+                    .collect::<Vec<_>>()
+                    .await;
+
+                tables.push(responses::TableWithColumns {
+                    table_name,
+                    columns,
+                });
+            }
+
+            tables.sort_by_key(|t| t.table_name.len());
+            Ok(responses::TablesWithColumns { tables })
+        }
+
+        async fn query(&self, query: String) -> color_eyre::Result<responses::Query> {
+            let mut client = self.client.lock().await;
+
+            let mut query = client.query(query, &[]).await?;
+            let columns: Vec<String> = query
+                .columns()
+                .await?
+                .unwrap_or_default()
+                .iter()
+                .map(|c| c.name().to_owned())
+                .collect();
+
+            let rows = tokio::time::timeout(
+                self.query_timeout,
+                query
+                    .into_row_stream()
+                    .map_ok(|row| row.into_iter().map(mssql_value_to_json).collect::<Vec<_>>())
+                    .filter_map(|count| async { count.ok() })
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+
+            Ok(responses::Query { columns, rows })
+        }
+    }
+}
+
 mod helpers {
     use duckdb::types::ValueRef as DuckdbValue;
     use libsql::Value as LibsqlValue;
+    use tiberius::ColumnData;
     use tokio_rusqlite::types::ValueRef as SqliteValue;
 
     pub fn format_size(mut size: f64) -> String {
@@ -3206,6 +3761,53 @@ mod helpers {
             Decimal(x) => serde_json::json!(x),
             Text(_) => serde_json::Value::String(v.as_str().unwrap().to_owned()),
             v => serde_json::Value::String(format!("{v:?}")),
+        }
+    }
+
+    pub fn mssql_value_to_json(v: ColumnData<'static>) -> serde_json::Value {
+        use ColumnData::*;
+        match v {
+            U8(x) => serde_json::json!(x),
+            I16(x) => serde_json::json!(x),
+            I32(x) => serde_json::json!(x),
+            I64(x) => serde_json::json!(x),
+            F32(x) => serde_json::json!(x),
+            F64(x) => serde_json::json!(x),
+            Bit(x) => serde_json::json!(x),
+            String(x) => serde_json::json!(x),
+            Guid(x) => serde_json::json!(x),
+            Binary(x) => serde_json::json!(x),
+            Numeric(x) => serde_json::json!(x.map(|x| x.value())),
+            Xml(x) => serde_json::json!(x.map(|x| x.to_string())),
+            DateTime(x) => serde_json::json!(x.map(|x| format!(
+                "{} days and {} second fragments",
+                x.days(),
+                x.seconds_fragments()
+            ))),
+            SmallDateTime(x) => serde_json::json!(x.map(|x| format!(
+                "{} days and {} second fragments",
+                x.days(),
+                x.seconds_fragments()
+            ))),
+            Time(x) => serde_json::json!(x.map(|x| format!(
+                "{} increments and {} scale",
+                x.increments(),
+                x.scale()
+            ))),
+            Date(x) => serde_json::json!(x.map(|x| format!("{} days", x.days()))),
+            DateTime2(x) => serde_json::json!(x.map(|x| format!(
+                "{} days, {} increments and {} scale",
+                x.date().days(),
+                x.time().increments(),
+                x.time().scale()
+            ))),
+            DateTimeOffset(x) => serde_json::json!(x.map(|x| format!(
+                "{} days, {} increments, {} scale and {} offset",
+                x.datetime2().date().days(),
+                x.datetime2().time().increments(),
+                x.datetime2().time().scale(),
+                x.offset()
+            ))),
         }
     }
 }
