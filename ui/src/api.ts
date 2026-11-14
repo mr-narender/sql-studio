@@ -6,6 +6,8 @@ let basePath = document.querySelector<HTMLMetaElement>(
 );
 const BASE_URL = basePath ? `${basePath.content}/api` : "/api";
 
+export class Unauthorized extends Error {}
+
 const counts = z
   .object({
     name: z.string(),
@@ -38,6 +40,7 @@ const overview = z.object({
 
 const tables = z.object({
   tables: counts,
+  views: z.string().array(),
 });
 
 const table = z.object({
@@ -62,6 +65,7 @@ const query = z.object({
 const metadata = z.object({
   version: z.string(),
   can_shutdown: z.boolean(),
+  can_logout: z.boolean(),
 });
 
 const autocomplete = z.object({
@@ -73,14 +77,23 @@ const autocomplete = z.object({
     .array(),
 });
 
-const $fetch = createZodFetcher();
+const $fetch = createZodFetcher(
+  async (input: RequestInfo | URL, init?: RequestInit) => {
+    const res = await fetch(input, init);
+    if (res.status === 401) throw new Unauthorized();
+    return res.json();
+  },
+);
 
 export const fetchOverview = () => $fetch(overview, `${BASE_URL}/`);
 export const fetchTables = () => $fetch(tables, `${BASE_URL}/tables`);
 export const fetchTable = (name: string) =>
   $fetch(table, `${BASE_URL}/tables/${encodeURIComponent(name)}`);
 export const fetchTableData = (name: string, page: number) =>
-  $fetch(tableData, `${BASE_URL}/tables/${encodeURIComponent(name)}/data?page=${page}`);
+  $fetch(
+    tableData,
+    `${BASE_URL}/tables/${encodeURIComponent(name)}/data?page=${page}`,
+  );
 export const fetchQuery = (value: string) =>
   $fetch(query, `${BASE_URL}/query`, {
     method: "POST",
@@ -96,6 +109,15 @@ export const fetchAutocomplete = () =>
 
 export const sendShutdown = () =>
   fetch(`${BASE_URL}/shutdown`, { method: "POST" });
+
+export const login = (username: string, password: string) =>
+  fetch(`${BASE_URL}/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+
+export const logout = () => fetch(`${BASE_URL}/logout`, { method: "POST" });
 
 const erdColumn = z.object({
   name: z.string(),

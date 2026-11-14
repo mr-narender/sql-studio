@@ -29,7 +29,7 @@ const MIN_EDITOR_HEIGHT = 120;
 const maxEditorHeight = () =>
   Math.min(600, Math.floor(window.innerHeight * 0.6));
 
-export const Route = createFileRoute("/query")({
+export const Route = createFileRoute("/_app/query")({
   component: Query,
   validateSearch: z.object({ sql: z.string().optional() }),
 });
@@ -116,7 +116,11 @@ function Query() {
   ) : (
     <Card className="p-2 overflow-auto">
       <DataGrid
-        defaultColumnOptions={{ resizable: true }}
+        defaultColumnOptions={{
+          resizable: true,
+          width: "max-content",
+          maxWidth: 400,
+        }}
         columns={data.columns.map((col) => ({
           key: col,
           name: col,
