@@ -31,6 +31,10 @@ struct Args {
     /// Don't show the shutdown button in the UI.
     #[clap(long, env)]
     no_shutdown: bool,
+
+    /// Require logging in with these credentials. [e.g admin:secret]
+    #[clap(long, env)]
+    auth: Option<auth::Credentials>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -175,9 +179,18 @@ async fn main() -> color_eyre::Result<()> {
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
 
-    let api = warp::path("api").and(
-        handlers::routes(db, args.no_shutdown, shutdown_tx).recover(rejections::handle_rejection),
-    );
+    let api = handlers::routes(db, args.no_shutdown, args.auth.is_some(), shutdown_tx);
+    let api = match args.auth {
+        Some(credentials) => {
+            let auth = auth::Auth::new(credentials);
+            auth::routes(auth.clone())
+                .or(auth::session(auth).and(api))
+                .map(warp::Reply::into_response)
+                .boxed()
+        }
+        None => api.map(warp::Reply::into_response).boxed(),
+    };
+    let api = warp::path("api").and(api.recover(rejections::handle_rejection));
     let homepage = statics::homepage(index_html.clone());
     let statics = statics::routes(
         match args.base_path.as_ref() {
@@ -732,11 +745,21 @@ mod sqlite {
 
                     counts.sort_by(|a, b| a.count.cmp(&b.count).then(a.name.cmp(&b.name)));
 
-                    Ok(counts)
+                    let views = conn
+                        .prepare(&sql!(
+                            r#"SELECT name FROM sqlite_master WHERE type="view" ORDER BY name"#
+                        ))?
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    Ok(responses::Tables {
+                        tables: counts,
+                        views,
+                    })
                 })
                 .await?;
 
-            Ok(responses::Tables { tables })
+            Ok(tables)
         }
 
         async fn table(&self, name: String) -> color_eyre::Result<responses::Table> {
@@ -749,7 +772,7 @@ mod sqlite {
                         &sql!(
                             r#"
                             SELECT sql FROM sqlite_master
-                            WHERE type="table" AND name = ?1
+                            WHERE type IN ('table', 'view') AND name = ?1
                             "#
                         ),
                         [&name],
@@ -840,7 +863,6 @@ mod sqlite {
                     ))?;
                     let columns = stmt
                         .column_names()
-                        .into_iter()
                         .map(ToOwned::to_owned)
                         .collect::<Vec<_>>();
 
@@ -904,7 +926,6 @@ mod sqlite {
                 let mut stmt = conn.prepare(&query)?;
                 let columns = stmt
                     .column_names()
-                    .into_iter()
                     .map(ToOwned::to_owned)
                     .collect::<Vec<_>>();
 
@@ -1306,7 +1327,20 @@ mod libsql {
 
             tables.sort_by_key(|r| r.count);
 
-            Ok(responses::Tables { tables })
+            let views = conn
+                .query(
+                    &sql!(r#"SELECT name FROM sqlite_master WHERE type="view" ORDER BY name"#),
+                    (),
+                )
+                .await?
+                .into_stream()
+                .map_ok(|r| r.get::<String>(0))
+                .try_collect::<Vec<_>>()
+                .await?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(responses::Tables { tables, views })
         }
 
         async fn table(&self, name: String) -> color_eyre::Result<responses::Table> {
@@ -1317,7 +1351,7 @@ mod libsql {
                     &sql!(
                         r#"
                         SELECT sql FROM sqlite_master
-                        WHERE type="table" AND name = ?1
+                        WHERE type IN ('table', 'view') AND name = ?1
                         "#
                     ),
                     [name.to_owned()],
@@ -1338,7 +1372,7 @@ mod libsql {
 
             let table_size = conn
                 .query(
-                    &sql!("SELECT SUM(pgsize) FROM dbstat WHERE name = ?1"),
+                    &sql!("SELECT coalesce(SUM(pgsize), 0) FROM dbstat WHERE name = ?1"),
                     [name.to_owned()],
                 )
                 .await?
@@ -1909,25 +1943,32 @@ mod postgres {
         async fn tables(&self) -> color_eyre::Result<responses::Tables> {
             let schema = &self.schema;
 
-            let mut tables = self
+            let mut tables = Vec::new();
+            let mut views = Vec::new();
+            for row in self
                 .client
                 .query(
                     &sql!(
                         r#"
-                        SELECT table_name
+                        SELECT table_name, table_type = 'VIEW'
                         FROM information_schema.tables
                         WHERE table_schema = $1
+                        ORDER BY table_name
                         "#
                     ),
                     &[schema],
                 )
                 .await?
-                .into_iter()
-                .map(|r| Count {
-                    name: r.get(0),
-                    count: 0,
-                })
-                .collect::<Vec<_>>();
+            {
+                if row.get(1) {
+                    views.push(row.get(0));
+                } else {
+                    tables.push(Count {
+                        name: row.get(0),
+                        count: 0,
+                    });
+                }
+            }
 
             for table in tables.iter_mut() {
                 let count: i64 = self
@@ -1940,7 +1981,7 @@ mod postgres {
 
             tables.sort_by_key(|r| r.count);
 
-            Ok(responses::Tables { tables })
+            Ok(responses::Tables { tables, views })
         }
 
         async fn table(&self, name: String) -> color_eyre::Result<responses::Table> {
@@ -2479,16 +2520,26 @@ mod mysql {
         async fn tables(&self) -> color_eyre::Result<responses::Tables> {
             let mut conn = self.pool.get_conn().await?;
 
-            let mut tables = sql!(
+            let mut tables = Vec::new();
+            let mut views = Vec::new();
+            for (name, table_type) in sql!(
                 r#"
-                SELECT TABLE_NAME AS name
+                SELECT TABLE_NAME AS name, TABLE_TYPE AS type
                 FROM information_schema.tables
                 WHERE table_schema = database()
+                ORDER BY TABLE_NAME
                 "#
             )
             .with(())
-            .map(&mut conn, |name| Count { name, count: 0 })
-            .await?;
+            .fetch::<(String, String), _>(&mut conn)
+            .await?
+            {
+                if table_type == "VIEW" {
+                    views.push(name);
+                } else {
+                    tables.push(Count { name, count: 0 });
+                }
+            }
 
             for table in tables.iter_mut() {
                 table.count = sql!("SELECT count(*) AS count FROM {}", quote_ident(&table.name))
@@ -2501,7 +2552,7 @@ mod mysql {
 
             tables.sort_by_key(|r| r.count);
 
-            Ok(responses::Tables { tables })
+            Ok(responses::Tables { tables, views })
         }
 
         async fn table(&self, name: String) -> color_eyre::Result<responses::Table> {
@@ -3054,11 +3105,26 @@ mod duckdb {
 
                 counts.sort_by_key(|r| r.count);
 
-                eyre::Ok(counts)
+                let views = c
+                    .prepare(&sql!(
+                        r#"
+                        SELECT table_name
+                        FROM information_schema.tables
+                        WHERE table_schema = 'main' AND table_type = 'VIEW'
+                        ORDER BY table_name
+                        "#
+                    ))?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<Result<Vec<String>, _>>()?;
+
+                eyre::Ok(responses::Tables {
+                    tables: counts,
+                    views,
+                })
             })
             .await??;
 
-            Ok(responses::Tables { tables })
+            Ok(tables)
         }
 
         async fn table(&self, name: String) -> color_eyre::Result<responses::Table> {
@@ -3068,7 +3134,11 @@ mod duckdb {
                 tokio::task::spawn_blocking(move || {
                     let c = c.lock().expect("could not get lock on connection");
 
-                    let sql = None;
+                    let sql = c.query_row(
+                        &sql!("SELECT max(sql) FROM duckdb_views() WHERE schema_name = 'main' AND view_name = ?"),
+                        [&name],
+                        |row| row.get(0),
+                    )?;
 
                     let row_count: i32 =
                         c.query_row(&sql!(r#"SELECT count(*) FROM "{name}""#), [], |row| {
@@ -3076,20 +3146,20 @@ mod duckdb {
                         })?;
 
                     let table_size: i64 = c.query_row(
-                        &sql!("SELECT estimated_size FROM duckdb_tables WHERE table_name = ?"),
+                        &sql!("SELECT coalesce(max(estimated_size), 0) FROM duckdb_tables WHERE table_name = ?"),
                         [&name],
                         |row| row.get(0),
                     )?;
                     let table_size = helpers::format_size(table_size as f64);
 
                     let index_count: i32 = c.query_row(
-                        &sql!("SELECT index_count FROM duckdb_tables WHERE table_name = ?"),
+                        &sql!("SELECT coalesce(max(index_count), 0) FROM duckdb_tables WHERE table_name = ?"),
                         [&name],
                         |row| row.get(0),
                     )?;
 
                     let column_count: i32 = c.query_row(
-                        &sql!("SELECT column_count FROM duckdb_tables WHERE table_name = ?"),
+                        &sql!("SELECT count(*) FROM duckdb_columns() WHERE schema_name = 'main' AND table_name = ?"),
                         [&name],
                         |row| row.get(0),
                     )?;
@@ -3442,6 +3512,7 @@ mod parquet {
                     name: self.table_name.clone(),
                     count,
                 }],
+                views: Vec::new(),
             })
         }
 
@@ -3760,6 +3831,7 @@ mod csv {
                     name: self.table_name.clone(),
                     count,
                 }],
+                views: Vec::new(),
             })
         }
 
@@ -4185,20 +4257,27 @@ mod clickhouse {
         }
 
         async fn tables(&self) -> color_eyre::Result<responses::Tables> {
-            let mut tables = self
+            let mut tables = Vec::new();
+            let mut views = Vec::new();
+            for (name, is_view) in self
                 .conn
                 .query(&sql!(
                     r#"
-                        SELECT name
+                        SELECT name, engine = 'View'
                         FROM system.tables
                         WHERE database = currentDatabase()
+                        ORDER BY name
                         "#
                 ))
-                .fetch_all()
+                .fetch_all::<(String, bool)>()
                 .await?
-                .into_iter()
-                .map(|name: String| Count { name, count: 0 })
-                .collect::<Vec<_>>();
+            {
+                if is_view {
+                    views.push(name);
+                } else {
+                    tables.push(Count { name, count: 0 });
+                }
+            }
 
             for count in tables.iter_mut() {
                 count.count = fetch_count(
@@ -4210,7 +4289,7 @@ mod clickhouse {
 
             tables.sort_by_key(|r| r.count);
 
-            Ok(responses::Tables { tables })
+            Ok(responses::Tables { tables, views })
         }
 
         async fn table(&self, name: String) -> color_eyre::Result<responses::Table> {
@@ -4799,7 +4878,27 @@ mod mssql {
 
             tables.sort_by_key(|c| std::cmp::Reverse(c.count));
 
-            Ok(responses::Tables { tables })
+            let views = client
+                .query(
+                    &sql!(
+                        r#"
+                        SELECT v.name AS name
+                        FROM sys.views v
+                        JOIN sys.schemas s ON v.schema_id = s.schema_id
+                        WHERE s.name = SCHEMA_NAME()
+                        ORDER BY v.name;
+                        "#
+                    ),
+                    &[],
+                )
+                .await?
+                .into_first_result()
+                .await?
+                .into_iter()
+                .filter_map(|row| row.get::<&str, &str>("name").map(ToOwned::to_owned))
+                .collect();
+
+            Ok(responses::Tables { tables, views })
         }
 
         async fn table(&self, name: String) -> color_eyre::Result<responses::Table> {
@@ -4820,7 +4919,7 @@ mod mssql {
                 .query(
                     &sql!(
                         r#"
-                        SELECT SUM(a.total_pages) * 8 AS size_kb
+                        SELECT ISNULL(SUM(a.total_pages), 0) * 8 AS size_kb
                         FROM sys.partitions p
                         JOIN sys.allocation_units a ON p.partition_id = a.container_id
                         JOIN sys.tables t ON p.object_id = t.object_id
@@ -4862,7 +4961,7 @@ mod mssql {
                         r#"
                         SELECT COUNT(*) AS count
                         FROM sys.columns c
-                        JOIN sys.tables t ON c.object_id = t.object_id
+                        JOIN sys.objects t ON c.object_id = t.object_id
                         JOIN sys.schemas s ON t.schema_id = s.schema_id
                         WHERE s.name = SCHEMA_NAME() AND t.name = @P1;
                         "#
@@ -5322,6 +5421,7 @@ mod responses {
     #[derive(Serialize)]
     pub struct Tables {
         pub tables: Vec<Count>,
+        pub views: Vec<String>,
     }
 
     #[derive(Serialize)]
@@ -5361,6 +5461,7 @@ mod responses {
     pub struct Metadata {
         pub version: String,
         pub can_shutdown: bool,
+        pub can_logout: bool,
     }
 
     #[derive(Serialize)]
@@ -5400,7 +5501,7 @@ mod handlers {
 
     use crate::{Database, ROWS_PER_PAGE, rejections, responses::Metadata};
 
-    fn same_site() -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
+    pub fn same_site() -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
         warp::header::optional::<String>("sec-fetch-site")
             .and_then(|site: Option<String>| async move {
                 if site.as_deref() == Some("cross-site") {
@@ -5412,7 +5513,7 @@ mod handlers {
             .untuple_one()
     }
 
-    fn json_content_type() -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
+    pub fn json_content_type() -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
         warp::header::optional::<String>("content-type")
             .and_then(|content_type: Option<String>| async move {
                 match content_type {
@@ -5433,6 +5534,7 @@ mod handlers {
     pub fn routes(
         db: impl Database + 'static,
         no_shutdown: bool,
+        can_logout: bool,
         shutdown_signal: mpsc::Sender<()>,
     ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
         let overview = warp::path::end()
@@ -5465,6 +5567,7 @@ mod handlers {
         let metadata = warp::get()
             .and(warp::path!("metadata"))
             .and(with_state(&no_shutdown))
+            .and(with_state(&can_logout))
             .and_then(metadata);
         let shutdown = warp::path!("shutdown")
             .and(warp::post())
@@ -5569,10 +5672,14 @@ mod handlers {
         Ok(warp::reply::json(&result))
     }
 
-    async fn metadata(no_shutdown: bool) -> Result<impl warp::Reply, warp::Rejection> {
+    async fn metadata(
+        no_shutdown: bool,
+        can_logout: bool,
+    ) -> Result<impl warp::Reply, warp::Rejection> {
         let version = Metadata {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             can_shutdown: !no_shutdown,
+            can_logout,
         };
 
         Ok(warp::reply::json(&version))
@@ -5598,6 +5705,163 @@ mod handlers {
     }
 }
 
+mod auth {
+    use std::{
+        collections::HashMap,
+        str::FromStr,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
+    use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+    use serde::Deserialize;
+    use subtle::ConstantTimeEq;
+    use warp::{
+        Filter,
+        http::{StatusCode, header},
+        reject::Rejection,
+        reply::Reply,
+    };
+
+    use crate::{
+        handlers::{json_content_type, same_site},
+        helpers::with_state,
+        rejections::{InternalServerError, Unauthorized},
+    };
+
+    const COOKIE: &str = "sql_studio_session";
+    const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+    const FAILED_LOGIN_DELAY: Duration = Duration::from_secs(1);
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct Credentials {
+        username: String,
+        password: String,
+    }
+
+    impl Credentials {
+        fn matches(&self, other: &Credentials) -> bool {
+            let username = self.username.as_bytes().ct_eq(other.username.as_bytes());
+            let password = self.password.as_bytes().ct_eq(other.password.as_bytes());
+            (username & password).into()
+        }
+    }
+
+    impl FromStr for Credentials {
+        type Err = &'static str;
+
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
+            let (username, password) = value
+                .split_once(':')
+                .ok_or("expected credentials in the form username:password")?;
+            Ok(Credentials {
+                username: username.to_owned(),
+                password: password.to_owned(),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct Auth {
+        credentials: Credentials,
+        sessions: Arc<Mutex<HashMap<String, Instant>>>,
+        login_lock: Arc<tokio::sync::Mutex<()>>,
+    }
+
+    impl Auth {
+        pub fn new(credentials: Credentials) -> Self {
+            Self {
+                credentials,
+                sessions: Default::default(),
+                login_lock: Default::default(),
+            }
+        }
+    }
+
+    pub fn routes(auth: Auth) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+        let login = warp::path!("login")
+            .and(warp::post())
+            .and(json_content_type())
+            .and(with_state(&auth))
+            .and(warp::header::optional::<String>("x-forwarded-proto"))
+            .and(warp::body::json::<Credentials>())
+            .and_then(login);
+        let logout = warp::path!("logout")
+            .and(warp::post())
+            .and(with_state(&auth))
+            .and(warp::cookie::optional::<String>(COOKIE))
+            .map(logout);
+
+        same_site().and(login.or(logout))
+    }
+
+    pub fn session(auth: Auth) -> impl Filter<Extract = (), Error = Rejection> + Clone {
+        warp::cookie::optional::<String>(COOKIE)
+            .and(with_state(&auth))
+            .and_then(check_session)
+            .untuple_one()
+    }
+
+    async fn check_session(token: Option<String>, auth: Auth) -> Result<(), Rejection> {
+        let sessions = auth.sessions.lock().unwrap();
+        match token.and_then(|token| sessions.get(&token)) {
+            Some(expires) if *expires > Instant::now() => Ok(()),
+            _ => Err(warp::reject::custom(Unauthorized)),
+        }
+    }
+
+    async fn login(
+        auth: Auth,
+        forwarded_proto: Option<String>,
+        given: Credentials,
+    ) -> Result<impl Reply, Rejection> {
+        // Holding the lock through the delay lets only one password be tried per second.
+        let _attempt = auth.login_lock.lock().await;
+        if !auth.credentials.matches(&given) {
+            tokio::time::sleep(FAILED_LOGIN_DELAY).await;
+            return Err(warp::reject::custom(Unauthorized));
+        }
+
+        let mut bytes = [0; 32];
+        getrandom::fill(&mut bytes).map_err(|e| {
+            tracing::error!("error while generating a session token: {e}");
+            warp::reject::custom(InternalServerError)
+        })?;
+        let token = BASE64_URL_SAFE_NO_PAD.encode(bytes);
+
+        let now = Instant::now();
+        let mut sessions = auth.sessions.lock().unwrap();
+        sessions.retain(|_, expires| *expires > now);
+        sessions.insert(token.clone(), now + SESSION_TTL);
+
+        let secure = if forwarded_proto.as_deref() == Some("https") {
+            "; Secure"
+        } else {
+            ""
+        };
+        Ok(warp::reply::with_header(
+            StatusCode::NO_CONTENT,
+            header::SET_COOKIE,
+            format!(
+                "{COOKIE}={token}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict{secure}",
+                SESSION_TTL.as_secs()
+            ),
+        ))
+    }
+
+    fn logout(auth: Auth, token: Option<String>) -> impl Reply {
+        if let Some(token) = token {
+            auth.sessions.lock().unwrap().remove(&token);
+        }
+
+        warp::reply::with_header(
+            StatusCode::NO_CONTENT,
+            header::SET_COOKIE,
+            format!("{COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"),
+        )
+    }
+}
+
 mod rejections {
     use std::convert::Infallible;
 
@@ -5618,7 +5882,12 @@ mod rejections {
         };
     }
 
-    rejects!(InternalServerError, Forbidden, UnsupportedMediaType);
+    rejects!(
+        InternalServerError,
+        Forbidden,
+        UnsupportedMediaType,
+        Unauthorized
+    );
 
     pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
         let code;
@@ -5640,6 +5909,9 @@ mod rejections {
         } else if let Some(Forbidden) = err.find() {
             code = StatusCode::FORBIDDEN;
             message = "FORBIDDEN";
+        } else if let Some(Unauthorized) = err.find() {
+            code = StatusCode::UNAUTHORIZED;
+            message = "UNAUTHORIZED";
         } else if err.find::<UnsupportedMediaType>().is_some()
             || err.find::<warp::reject::UnsupportedMediaType>().is_some()
         {
